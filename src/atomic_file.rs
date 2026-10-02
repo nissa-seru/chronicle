@@ -166,7 +166,20 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
         .unwrap_or(Path::new("."));
 
     #[cfg(unix)]
-    let directory = File::open(parent)?;
+    let directory = File::open(parent).map_err(|error| {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot open checkpoint directory {} for synchronization: directory read \
+                     permission is required to durably publish metadata ({error})",
+                    parent.display()
+                ),
+            )
+        } else {
+            error
+        }
+    })?;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let (mut temporary, source) = unix_security::prepare(path, parent)?;
@@ -306,6 +319,39 @@ mod tests {
         let before = Handle::from_path(&alias).unwrap();
         Checkpoint::default().save(&alias, &[b"same"]).unwrap();
         assert_ne!(Handle::from_path(&alias).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_reports_requirement_before_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        fs::write(&path, b"previous checkpoint").unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        // Restore even after an assertion failure, so TempDir can clean up.
+        struct Restore<'a>(&'a Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                fs::set_permissions(self.0, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let _restore = Restore(dir.path());
+        if File::open(dir.path()).is_ok() {
+            eprintln!("directory access checks bypassed by this user; permission probe skipped");
+            return;
+        }
+        let result = atomic_write(&path, |_| panic!("must fail before writing"));
+        match result {
+            Err(crate::StoreError::Io(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(error
+                    .to_string()
+                    .contains("directory read permission is required"));
+            }
+            other => panic!("expected contextual permission error, got {other:?}"),
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"previous checkpoint");
     }
 
     #[test]

@@ -1725,6 +1725,9 @@ impl Store {
     /// This is O(1) - only syncs the log file and small metadata files.
     /// The record index is not persisted; it's rebuilt from the log on startup.
     pub fn sync(&self) -> Result<()> {
+        // Keep the durable log and metadata publication ordered with record
+        // writers and other syncs. A newer checkpoint must not be overtaken.
+        let _lock = self.write_lock.lock();
         // Sync the append-only log (O(1) - just fsync)
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)
@@ -2174,6 +2177,32 @@ mod tests {
         let blob = store.get_blob(&hash).unwrap().unwrap();
         assert_eq!(blob.content, content);
         assert_eq!(blob.content_type, "application/javascript");
+    }
+
+    #[test]
+    fn sync_waits_for_active_writer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::create(test_config(&dir)).unwrap());
+        store.sync().unwrap();
+        let writer = store.write_lock.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let sync_store = Arc::clone(&store);
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(sync_store.sync()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let while_locked = finished_rx.recv_timeout(Duration::from_millis(250));
+        drop(writer);
+        assert!(
+            matches!(while_locked, Err(mpsc::RecvTimeoutError::Timeout)),
+            "sync passed an active writer: {while_locked:?}"
+        );
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        thread.join().unwrap();
     }
 
     #[test]
