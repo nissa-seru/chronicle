@@ -146,12 +146,40 @@ fn unsupported(message: &str) -> io::Error {
 }
 
 fn wide(path: &Path) -> io::Result<Vec<u16>> {
-    let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // CreateFileW alone does not provide std::fs's long-path conversion. Use
+    // std's public Windows normalization (GetFullPathNameW) before adding a
+    // verbatim prefix to long DOS/UNC paths. Canonicalization would require the
+    // destination to exist and could follow a reparse point before validation.
+    let verbatim: &[u16] = &[92, 92, 63, 92]; // \\?\
+    let nt: &[u16] = &[92, 63, 63, 92]; // \??\
+    let mut original: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if original.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NUL in checkpoint path",
+        ));
+    }
+    if original.starts_with(verbatim) || original.starts_with(nt) {
+        original.push(0);
+        return Ok(original);
+    }
+    let absolute = std::path::absolute(path)?;
+    let mut value: Vec<u16> = absolute.as_os_str().encode_wide().collect();
     if value.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "NUL in checkpoint path",
         ));
+    }
+    if value.len() + 1 >= 248 && !value.starts_with(verbatim) && !value.starts_with(nt) {
+        let device: Vec<u16> = "\\\\.\\".encode_utf16().collect();
+        if value.starts_with(&device) {
+            value.splice(..4, verbatim.iter().copied());
+        } else if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            value.splice(..2, "\\\\?\\UNC\\".encode_utf16());
+        } else if value.get(1) == Some(&(b':' as u16)) && value.get(2) == Some(&(b'\\' as u16)) {
+            value.splice(..0, verbatim.iter().copied());
+        }
     }
     value.push(0);
     Ok(value)
@@ -516,5 +544,117 @@ mod tests {
         assert!(equivalent(&before, &Descriptor::read(&source).unwrap()).unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"old checkpoint");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unreadable_source_security_rejects_before_payload_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.bin");
+        fs::write(&path, b"old checkpoint").unwrap();
+        let source = open_native(&path, READ_CONTROL | WRITE_DAC, OPEN_EXISTING, null()).unwrap();
+        // OWNER RIGHTS also suppresses the owner's implicit READ_CONTROL.
+        set_policy(
+            &source,
+            "D:P(D;;RC;;;OW)(A;;FA;;;OW)",
+            DACL_SECURITY_INFORMATION,
+        );
+        let result = super::super::atomic_write(&path, |_| {
+            panic!("unreadable descriptor must reject before bytes")
+        });
+        // This preexisting handle keeps WRITE_DAC; restore test permissions
+        // before checking the result so failure assertions leave clean fixtures.
+        set_policy(&source, "D:P(A;;FA;;;OW)", DACL_SECURITY_INFORMATION);
+        assert!(
+            matches!(result, Err(crate::StoreError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"old checkpoint");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn changed_parent_inheritance_never_writes_under_different_controls() {
+        use std::cell::Cell;
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = fs::OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir.path())
+            .unwrap();
+        set_policy(&parent, "D:P(A;OICI;FA;;;OW)", DACL_SECURITY_INFORMATION);
+        let path = dir.path().join("state.bin");
+        fs::write(&path, b"old checkpoint").unwrap();
+        // Add and remove a parent grant after the source file already exists.
+        // Native propagation can update the source's inherited ACL each time.
+        for parent_policy in ["D:P(A;OICI;FA;;;OW)(A;OICI;GR;;;BG)", "D:P(A;OICI;FA;;;OW)"] {
+            set_policy(&parent, parent_policy, DACL_SECURITY_INFORMATION);
+            let source = open_native(&path, READ_CONTROL, OPEN_EXISTING, null()).unwrap();
+            let expected = Descriptor::read(&source).unwrap();
+            let before = fs::read(&path).unwrap();
+            let called = Cell::new(false);
+            let result = super::super::atomic_write(&path, |file| {
+                called.set(true);
+                assert!(
+                    equivalent(&expected, &Descriptor::read(file).unwrap()).unwrap(),
+                    "changed inheritance must be checked before payload"
+                );
+                file.write_all(b"new checkpoint")?;
+                Ok(())
+            });
+            match result {
+                Ok(published) => {
+                    assert!(called.get());
+                    assert!(equivalent(&expected, &Descriptor::read(&published).unwrap()).unwrap());
+                    assert_eq!(fs::read(&path).unwrap(), b"new checkpoint");
+                }
+                Err(_) => {
+                    assert!(
+                        !called.get(),
+                        "a rejected inheritance result must remain empty"
+                    );
+                    assert_eq!(fs::read(&path).unwrap(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_long_paths_support_creation_and_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = root.path().to_owned();
+        for _ in 0..6 {
+            parent.push("checkpoint-long-path-segment-without-verbatim-prefix");
+        }
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("state.bin");
+        assert!(path.as_os_str().encode_wide().count() > 300);
+        assert!(!path.to_string_lossy().starts_with(r"\\?\"));
+        for bytes in [b"first".as_slice(), b"replacement".as_slice()] {
+            super::super::atomic_write(&path, |file| Ok(file.write_all(bytes)?)).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        let verbatim = fs::canonicalize(&path).unwrap();
+        super::super::atomic_write(&verbatim, |file| Ok(file.write_all(b"verbatim")?)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"verbatim");
+    }
+
+    #[test]
+    fn native_path_conversion_preserves_verbatim_and_long_unc_names() {
+        let nt = Path::new(r"\??\C:\checkpoint.bin");
+        assert_eq!(
+            wide(nt).unwrap(),
+            nt.as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+        );
+        let unc = format!(r"\\server\share\{}\checkpoint.bin", "segment".repeat(50));
+        let converted = wide(Path::new(&unc)).unwrap();
+        let expected = format!(r"\\?\UNC\{}", &unc[2..]);
+        assert_eq!(
+            converted,
+            expected.encode_utf16().chain(Some(0)).collect::<Vec<_>>()
+        );
     }
 }
