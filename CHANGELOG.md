@@ -14,6 +14,7 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ### Fixed
 
+- After a metadata checkpoint fails, further mutations retry that checkpoint before accepting writes that could depend on an unpersisted state registration or branch. The tentative in-memory mutation remains available for inspection; `sync()` can retry explicitly. Historical branch creation completes its fallible chain reads before allocating a branch.
 - Reopening a store replays complete state updates after its metadata checkpoint, including snapshot accounting and fresh secondary indexes. State registration, strategy changes, and branch creation/deletion/switching now checkpoint before returning. Store checkpoints are serialized with writes, and branch identities found only in partially published state metadata are reserved against reuse. No on-disk format change; record updates still use `sync()` as their durability barrier against OS or device loss.
 
 - Metadata checkpoints (`state.bin`, `branches.bin`, and `state-indexes.bin`) now replace the previous file atomically after writing and syncing a same-directory temporary file. An interrupted save leaves the previous complete checkpoint available instead of truncating it. Unix also syncs the containing directory after replacement. Existing file encodings are unchanged.

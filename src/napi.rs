@@ -1130,6 +1130,8 @@ impl JsStore {
     /// Reopen replays complete surviving log records after a process crash;
     /// use this durability barrier to protect writes against OS/device loss.
     /// State-registration metadata and branch mutations checkpoint automatically.
+    /// After a metadata-checkpoint error, further mutations retry that checkpoint
+    /// before proceeding. The tentative in-memory metadata is retained.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;

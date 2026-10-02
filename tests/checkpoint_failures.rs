@@ -1,0 +1,225 @@
+//! A failed metadata checkpoint must not admit dependent writes. The child
+//! repairs the injected I/O failure, writes successfully, then exits without
+//! destructors so reopen cannot rely on a final Store::drop checkpoint.
+
+use chronicle::{
+    Branch, FieldIndexKind, RecordInput, Sequence, StateOperation, StateRegistration,
+    StateStrategy, Store, StoreConfig, StoreError,
+};
+use serde_json::{json, Value};
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
+
+fn config(path: &Path) -> StoreConfig {
+    StoreConfig {
+        path: path.to_owned(),
+        ..Default::default()
+    }
+}
+
+fn registration(id: &str) -> StateRegistration {
+    StateRegistration {
+        id: id.into(),
+        strategy: StateStrategy::AppendLog {
+            delta_snapshot_every: 100,
+            full_snapshot_every: 100,
+        },
+        initial_value: None,
+    }
+}
+
+fn append(store: &Store, n: i32) -> chronicle::Result<chronicle::Record> {
+    store.update_state("items", StateOperation::Append(n.to_string().into_bytes()))
+}
+
+fn assert_io<T>(result: chronicle::Result<T>) {
+    match result {
+        Err(StoreError::Io(_)) => {}
+        Err(other) => panic!("expected pending-checkpoint I/O error, got {other}"),
+        Ok(_) => panic!("mutation succeeded despite pending checkpoint failure"),
+    }
+}
+
+// Replacing a metadata pathname with a directory forces atomic publication
+// to fail on every platform, without relying on root/permission behavior.
+fn obstruct(path: &Path) -> Option<Vec<u8>> {
+    let previous = if path.exists() {
+        Some(fs::read(path).unwrap())
+    } else {
+        None
+    };
+    if previous.is_some() {
+        fs::remove_file(path).unwrap();
+    }
+    fs::create_dir(path).unwrap();
+    previous
+}
+
+fn repair(path: &Path, previous: Option<Vec<u8>>) {
+    fs::remove_dir(path).unwrap();
+    if let Some(bytes) = previous {
+        fs::write(path, bytes).unwrap();
+    }
+}
+
+fn check_write_admission(store: &Store) {
+    let before_len = fs::metadata(store.path().join("records.log"))
+        .unwrap()
+        .len();
+    let before_count = store.stats().unwrap().record_count;
+    let before_branches = store.list_branches().len();
+    let before_head = store.current_branch().head;
+    assert_io(store.append(RecordInput::raw("event", b"blocked".to_vec())));
+    assert_io(append(store, 99));
+    assert_io(store.register_state(registration("other")));
+    assert_io(store.update_state_strategy(
+        "items",
+        StateStrategy::AppendLog {
+            delta_snapshot_every: 50,
+            full_snapshot_every: 20,
+        },
+    ));
+    assert_io(store.register_state_field_index("items", "/n", FieldIndexKind::Number));
+    assert_io(store.create_branch("blocked", None));
+    assert_io(store.create_empty_branch("blocked-empty", None));
+    assert_io(store.create_branch_at("blocked-at", "main", Sequence(0)));
+    assert_io(store.switch_branch("main"));
+    assert_io(store.delete_branch("missing"));
+    assert_io(store.sync());
+    assert_eq!(
+        fs::metadata(store.path().join("records.log"))
+            .unwrap()
+            .len(),
+        before_len
+    );
+    assert_eq!(store.stats().unwrap().record_count, before_count);
+    assert_eq!(store.stats().unwrap().state_slot_count, 1);
+    assert_eq!(store.list_branches().len(), before_branches);
+    assert_eq!(store.current_branch().head, before_head);
+    assert!(store
+        .query_state_index_range("items", "/n", None, None, None, None, false)
+        .is_none());
+}
+
+fn create_branch(store: &Store, kind: &str) -> chronicle::Result<Branch> {
+    match kind {
+        "branch" => store.create_branch("feature", None),
+        "empty" => store.create_empty_branch("feature", None),
+        "at" => store.create_branch_at("feature", "main", Sequence(1)),
+        other => panic!("unknown branch kind {other}"),
+    }
+}
+
+#[test]
+fn failed_checkpoint_child() {
+    let Some(path) = std::env::var_os("CHRONICLE_CHECKPOINT_FAILURE_PATH") else {
+        return;
+    };
+    let path = Path::new(&path);
+    let scenario = std::env::var("CHRONICLE_CHECKPOINT_FAILURE_SCENARIO").unwrap();
+    let store = Store::create(config(path)).unwrap();
+    store.set_auto_snapshot(false);
+    if scenario == "registration" {
+        let state_path = path.join("state.bin");
+        let previous = obstruct(&state_path);
+        assert_io(store.register_state(registration("items")));
+        assert_io(store.register_state(registration("items")));
+        check_write_admission(&store);
+        repair(&state_path, previous);
+        // Retry finishes the pending checkpoint before reporting the retained
+        // registration. Subsequent writes may now safely use its definition.
+        assert!(matches!(
+            store.register_state(registration("items")),
+            Err(StoreError::StateExists(_))
+        ));
+    } else {
+        store.register_state(registration("items")).unwrap();
+        append(&store, 0).unwrap();
+        append(&store, 1).unwrap();
+        store.sync().unwrap();
+        let branches_path = path.join("branches.bin");
+        let previous = obstruct(&branches_path);
+        assert_io(create_branch(&store, &scenario));
+        check_write_admission(&store);
+        repair(&branches_path, previous);
+        assert!(matches!(
+            create_branch(&store, &scenario),
+            Err(StoreError::BranchExists(_))
+        ));
+        store.switch_branch("feature").unwrap();
+    }
+    append(&store, 42).unwrap();
+    std::process::exit(73);
+}
+
+fn run_crash(path: &Path, scenario: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "failed_checkpoint_child", "--nocapture"])
+        .env("CHRONICLE_CHECKPOINT_FAILURE_PATH", path)
+        .env("CHRONICLE_CHECKPOINT_FAILURE_SCENARIO", scenario)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn failed_registration_blocks_writes_until_checkpoint_retry_succeeds() {
+    let dir = TempDir::new().unwrap();
+    run_crash(dir.path(), "registration");
+    let store = Store::open(config(dir.path())).unwrap();
+    assert_eq!(store.stats().unwrap().state_slot_count, 1);
+    assert_eq!(store.get_state_len("items").unwrap(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&store.get_state("items").unwrap().unwrap()).unwrap(),
+        json!([42])
+    );
+}
+
+#[test]
+fn failed_branch_publication_blocks_writes_until_checkpoint_retry_succeeds() {
+    for (kind, expected) in [
+        ("branch", json!([0, 1, 42])),
+        ("at", json!([0, 42])),
+        ("empty", json!([42])),
+    ] {
+        let dir = TempDir::new().unwrap();
+        run_crash(dir.path(), kind);
+        let store = Store::open(config(dir.path())).unwrap();
+        assert_eq!(store.current_branch().name, "feature");
+        assert_eq!(store.list_branches().len(), 2);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&store.get_state("items").unwrap().unwrap()).unwrap(),
+            expected,
+            "{kind}"
+        );
+        store.switch_branch("main").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&store.get_state("items").unwrap().unwrap()).unwrap(),
+            json!([0, 1])
+        );
+    }
+}
+
+#[test]
+fn failed_historical_chain_read_does_not_allocate_a_partial_branch() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    store.register_state(registration("items")).unwrap();
+    // The append fast path accepts these bytes, but this malformed payload
+    // cannot be materialized while preparing the historical branch's count.
+    store
+        .update_state("items", StateOperation::Append(b"not-json".to_vec()))
+        .unwrap();
+    assert!(store.create_branch_at("bad", "main", Sequence(1)).is_err());
+    assert_eq!(store.list_branches().len(), 1);
+    let fresh = store.create_empty_branch("fresh", None).unwrap();
+    assert_eq!(fresh.id.0, 2);
+}

@@ -62,6 +62,15 @@ const STORE_MAGIC: &[u8; 4] = b"RST\0";
 /// Current store format version.
 const STORE_VERSION: u8 = 1;
 
+/// Admission state protected by the store's write mutex.
+#[derive(Default)]
+struct WriteState {
+    /// Metadata-only mutations cannot be replayed from records.log. If their
+    /// checkpoint failed, finish it before allowing another mutation to use
+    /// the in-memory definition. Reads may still inspect that tentative state.
+    checkpoint_required: bool,
+}
+
 /// The main record store.
 ///
 /// Provides a unified interface for:
@@ -95,7 +104,7 @@ pub struct Store {
     subscriptions: SubscriptionManager,
 
     /// Lock for write operations to ensure atomicity.
-    write_lock: Mutex<()>,
+    write_lock: Mutex<WriteState>,
 
     /// When false, `update_state` skips the auto-snapshot pass. Bulk loaders
     /// (e.g. importers) turn this off to avoid the O(N²) snapshot series and
@@ -148,7 +157,7 @@ impl Store {
             state,
             branches,
             subscriptions: SubscriptionManager::new(),
-            write_lock: Mutex::new(()),
+            write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
         })
     }
@@ -260,7 +269,7 @@ impl Store {
             state,
             branches,
             subscriptions: SubscriptionManager::new(),
-            write_lock: Mutex::new(()),
+            write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
         })
     }
@@ -310,7 +319,8 @@ impl Store {
                 "record type 'state_update' is reserved; use update_state instead".into(),
             ));
         }
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
 
         let branch = self.branches.current_branch();
         let next_seq = branch.head.next();
@@ -443,9 +453,11 @@ impl Store {
     /// Register a new state and persist its strategy before returning.
     /// The log cannot reconstruct a lost registration after a crash.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         self.state.register_state(registration)?;
-        self.sync_locked()
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)
     }
 
     /// Update the strategy parameters of an already-registered state (same
@@ -457,9 +469,11 @@ impl Store {
         state_id: &str,
         strategy: crate::types::StateStrategy,
     ) -> Result<()> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         self.state.update_state_strategy(state_id, strategy)?;
-        self.sync_locked()
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)
     }
 
     /// Update a state and record it.
@@ -543,7 +557,8 @@ impl Store {
     where
         F: FnOnce(RecordId, Sequence) -> Result<StateOperation>,
     {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
 
         if self.state.get_strategy(state_id).is_none() {
             return Err(StoreError::StateNotRegistered(state_id.to_string()));
@@ -649,7 +664,7 @@ impl Store {
         // Done after indices/branch update so the snapshot sees consistent state
         if !skip_auto_snapshot && self.auto_snapshot_enabled.load(Ordering::Relaxed) {
             // Drop the lock before calling auto_snapshot to avoid deadlock
-            drop(_lock);
+            drop(write);
             self.auto_snapshot_if_needed(state_id)?;
         }
 
@@ -1413,7 +1428,8 @@ impl Store {
         field_path: &str,
         kind: crate::state::FieldIndexKind,
     ) -> Result<()> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let branch_id = self.branches.current_branch().id;
         self.state
             .register_field_index(branch_id, state_id, field_path, kind)
@@ -1665,7 +1681,8 @@ impl Store {
 
     /// Create a new branch from the current branch head and checkpoint it.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let parent = if let Some(from_name) = from {
             self.branches.get_branch(from_name).ok_or_else(|| {
                 StoreError::BranchNotFound(from_name.to_string())
@@ -1681,7 +1698,8 @@ impl Store {
         self.state.copy_heads_for_branch(parent.id, new_branch.id);
 
         // Persist copied state heads before publishing the branch identity.
-        self.sync_locked()?;
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)?;
 
         // Broadcast branch created
         self.subscriptions.broadcast_branch_created(&new_branch, Some(parent_name));
@@ -1692,13 +1710,15 @@ impl Store {
     /// Create and checkpoint a branch without copying state from parent.
     /// This is useful for creating branches with custom state (e.g., time-travel branching).
     pub fn create_empty_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let parent_name = from.map(|n| n.to_string()).or_else(|| {
             Some(self.branches.current_branch().name.clone())
         });
         let new_branch = self.branches.create_branch(name, from)?;
 
-        self.sync_locked()?;
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)?;
 
         // Broadcast branch created
         self.subscriptions.broadcast_branch_created(&new_branch, parent_name);
@@ -1719,26 +1739,38 @@ impl Store {
     /// * `from` - Parent branch name to branch from
     /// * `at` - Sequence number on parent to branch at (must be <= parent's head)
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let parent = self
             .branches
             .get_branch(from)
             .ok_or_else(|| StoreError::BranchNotFound(from.to_string()))?;
 
-        let new_branch = self.branches.create_branch_at(name, from, at)?;
-
-        // Point the new branch's state heads at the parent's chain at the branch point.
-        // No new records are written - the branch shares the existing chain up to this point.
+        // Prepare all fallible chain reads before allocating a branch. A
+        // corrupt historical chain must not leave a partly constructed branch
+        // for a subsequent mutation (or Drop) to checkpoint.
+        if self.branches.get_branch(name).is_some() {
+            return Err(StoreError::BranchExists(name.to_string()));
+        }
+        if at > parent.head {
+            return Err(StoreError::InvalidSequence(at, parent.head));
+        }
+        let mut heads = Vec::new();
         for state_id in self.state.state_ids() {
             if let Some((head_offset, item_count)) =
                 self.find_chain_info_at(parent.id, &state_id, at)?
             {
-                self.state
-                    .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
+                heads.push((state_id, head_offset, item_count));
             }
         }
+        let new_branch = self.branches.create_branch_at(name, from, at)?;
+        for (state_id, head_offset, item_count) in heads {
+            self.state
+                .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
+        }
 
-        self.sync_locked()?;
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)?;
         self.subscriptions
             .broadcast_branch_created(&new_branch, Some(from.to_string()));
 
@@ -1747,9 +1779,11 @@ impl Store {
 
     /// Switch to a different branch and checkpoint the current-branch pointer.
     pub fn switch_branch(&self, name: &str) -> Result<Branch> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let branch = self.branches.switch_branch(name)?;
-        self.sync_locked()?;
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)?;
         Ok(branch)
     }
 
@@ -1765,9 +1799,11 @@ impl Store {
 
     /// Delete a branch and checkpoint the deletion.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         self.branches.delete_branch(name)?;
-        self.sync_locked()?;
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)?;
 
         // Broadcast branch deleted
         self.subscriptions.broadcast_branch_deleted(name);
@@ -1797,21 +1833,34 @@ impl Store {
     /// lost by the OS or storage device still require this barrier.
     /// Metadata-only mutations (registration and branch operations) checkpoint
     /// before returning because the record log cannot reconstruct them.
+    /// A metadata-checkpoint error retains the mutation in memory. Subsequent
+    /// mutations retry that checkpoint before proceeding, so a successful
+    /// write cannot depend on an unpersisted registration or branch. This
+    /// method can also explicitly retry it; metadata is not rolled back.
     /// The record index is rebuilt on startup; checkpoint cost depends on
     /// state heads, branch metadata, and any registered field indexes.
     pub fn sync(&self) -> Result<()> {
-        let _lock = self.write_lock.lock();
-        self.sync_locked()
+        let mut write = self.write_lock.lock();
+        self.sync_locked(&mut write)
+    }
+
+    /// Finish a failed metadata checkpoint before admitting another mutation.
+    fn retry_metadata_checkpoint(&self, write: &mut WriteState) -> Result<()> {
+        if write.checkpoint_required {
+            self.sync_locked(write)?;
+        }
+        Ok(())
     }
 
     /// Call only while holding write_lock, so a state head cannot reach disk
     /// ahead of its log record and branch/state checkpoints cannot interleave.
-    fn sync_locked(&self) -> Result<()> {
+    fn sync_locked(&self, write: &mut WriteState) -> Result<()> {
         // Sync the append-only log (O(1) - just fsync)
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)
         self.state.save()?;
         self.branches.save()?;
+        write.checkpoint_required = false;
         Ok(())
     }
 
