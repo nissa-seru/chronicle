@@ -4,8 +4,11 @@
 //! SACLs require privileges not normally held by a store and are not copied.
 //! Other enforcement SACL components, EFS, and reparse points fail closed.
 //! Readonly destinations fail before staging. Replacing an existing checkpoint
-//! requires READ_CONTROL and the ability to create its owner/group and native
-//! descriptor; inability to preserve them is an error, not a mode-only fallback.
+//! requires READ_CONTROL, DELETE/replace access, and the ability to create its
+//! owner/group and native descriptor. Staging deletion/rename access is checked
+//! before payload; pre-publication failure cleanup uses the retained
+//! DELETE-authorized creation handle. Once rename is attempted, an error leaves
+//! ownership uncertain and the file is preserved for diagnosis. Inability to preserve controls is an error, not a mode-only fallback.
 //! Concurrent external security/path changes and path-based policy equivalence
 //! are outside this single-writer per-file contract. Staging names need the same
 //! external policy coverage as checkpoint names.
@@ -19,7 +22,7 @@ use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::*;
@@ -139,6 +142,81 @@ pub(super) struct Security {
     descriptor: Descriptor,
 }
 
+/// Own cleanup authority on the actual staging file, independent of its DACL
+/// and of whether its former random pathname has since been reused.
+pub(super) struct Temporary {
+    file: Option<File>,
+    path: TempPath,
+    cleanup: bool,
+}
+
+impl Temporary {
+    fn new(temporary: NamedTempFile) -> Self {
+        let (file, mut path) = temporary.into_parts();
+        path.disable_cleanup(true);
+        Self {
+            file: Some(file),
+            path,
+            cleanup: true,
+        }
+    }
+
+    pub(super) fn as_file(&self) -> &File {
+        self.file.as_ref().unwrap()
+    }
+    pub(super) fn as_file_mut(&mut self) -> &mut File {
+        self.file.as_mut().unwrap()
+    }
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn rename(&mut self, path: &Path) -> io::Result<()> {
+        self.rename_with(path, |from, to| std::fs::rename(from, to))
+    }
+
+    fn rename_with(
+        &mut self,
+        path: &Path,
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        // From this point an error can leave publication uncertain. Our handle
+        // may already name the published checkpoint, so it must never delete
+        // the file in response to a failed acknowledgement.
+        self.cleanup = false;
+        if let Err(error) = rename(&self.path, path) {
+            tracing::warn!(error = %error, staging = %self.path.display(), destination = %path.display(),
+                "Windows checkpoint rename outcome is uncertain; preserving the file, which may remain at the staging name or be published");
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if self.cleanup {
+            if let Some(file) = self.file.as_ref() {
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                if unsafe {
+                    SetFileInformationByHandle(
+                        file.as_raw_handle(),
+                        FileDispositionInfo,
+                        &disposition as *const _ as _,
+                        size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                } == 0
+                {
+                    tracing::warn!(error = %io::Error::last_os_error(),
+                        "failed to remove Windows checkpoint staging file through its creation handle");
+                }
+            }
+        }
+        // Closing our DELETE-authorized handle completes deletion. TempPath's
+        // pathname cleanup is disabled, including after successful publication.
+    }
+}
+
 fn check(ok: i32) -> io::Result<()> {
     if ok == 0 {
         Err(io::Error::last_os_error())
@@ -228,10 +306,10 @@ fn validate_file(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn prepare(path: &Path, parent: &Path) -> io::Result<(NamedTempFile, Option<Security>)> {
+pub(super) fn prepare(path: &Path, parent: &Path) -> io::Result<(Temporary, Option<Security>)> {
     let source = match open_native(
         path,
-        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        READ_CONTROL | FILE_READ_ATTRIBUTES | DELETE,
         OPEN_EXISTING,
         null(),
     ) {
@@ -286,7 +364,7 @@ pub(super) fn prepare(path: &Path, parent: &Path) -> io::Result<(NamedTempFile, 
         .make_in(parent, |name| {
             open_native(
                 name,
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | DELETE,
                 CREATE_NEW,
                 if security.is_some() {
                     &attributes
@@ -295,7 +373,12 @@ pub(super) fn prepare(path: &Path, parent: &Path) -> io::Result<(NamedTempFile, 
                 },
             )
         })?;
+    let temp = Temporary::new(temp);
     validate_file(temp.as_file())?;
+    // Path-based rename must be possible too. Refuse before payload when the
+    // inherited/source DACL and parent deny it; Drop still has creation-handle
+    // DELETE authority and can remove the otherwise undeletable empty stage.
+    drop(open_native(temp.path(), DELETE, OPEN_EXISTING, null())?);
     if let Some(security) = security.as_ref() {
         let created = Descriptor::read(temp.as_file())?;
         created.validate_policy()?;
@@ -384,18 +467,9 @@ pub(super) fn finish(security: Option<&Security>, temporary: &File) -> io::Resul
 
 /// Publish without tempfile::persist's path-based attribute reset. The file
 /// was created without FILE_ATTRIBUTE_TEMPORARY and already synced by caller.
-pub(super) fn publish(temporary: NamedTempFile, path: &Path) -> io::Result<File> {
-    let (file, mut temporary_path) = temporary.into_parts();
-    publish_path(&mut temporary_path, path)?;
-    Ok(file)
-}
-
-fn publish_path(temporary: &mut tempfile::TempPath, path: &Path) -> io::Result<()> {
-    std::fs::rename(&temporary, path)?;
-    // Our file no longer owns this staging name. A future reuse belongs to
-    // somebody else, so dropping the guard must not delete that name.
-    temporary.disable_cleanup(true);
-    Ok(())
+pub(super) fn publish(mut temporary: Temporary, path: &Path) -> io::Result<File> {
+    temporary.rename(path)?;
+    Ok(temporary.file.take().unwrap())
 }
 
 #[cfg(test)]
@@ -687,32 +761,31 @@ mod tests {
     #[test]
     fn successful_publication_disarms_cleanup_of_the_old_name() {
         let dir = tempfile::tempdir().unwrap();
-        let temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-        let (file, mut old_path) = temporary.into_parts();
-        let reused = old_path.to_path_buf();
         let destination = dir.path().join("state.bin");
-        publish_path(&mut old_path, &destination).unwrap();
+        let (mut temporary, _) = prepare(&destination, dir.path()).unwrap();
+        let reused = temporary.path().to_owned();
+        temporary.rename(&destination).unwrap();
         fs::write(&reused, b"another writer owns this name").unwrap();
-        drop(old_path);
+        drop(temporary);
         assert_eq!(fs::read(&reused).unwrap(), b"another writer owns this name");
         assert!(destination.exists());
-        drop(file);
     }
 
     #[test]
-    fn failed_publication_keeps_staging_cleanup_armed() {
+    fn rename_attempt_error_preserves_diagnostic_staging() {
         let dir = tempfile::tempdir().unwrap();
-        let temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-        let (file, mut old_path) = temporary.into_parts();
-        let cleanup = old_path.to_path_buf();
         let destination = dir.path().join("state.bin");
+        let (mut temporary, _) = prepare(&destination, dir.path()).unwrap();
+        let cleanup = temporary.path().to_owned();
         fs::create_dir(&destination).unwrap();
-        assert!(publish_path(&mut old_path, &destination).is_err());
+        assert!(temporary.rename(&destination).is_err());
         assert!(cleanup.exists());
-        drop(old_path);
-        assert!(!cleanup.exists());
+        drop(temporary);
+        assert!(
+            cleanup.exists(),
+            "an attempted publication leaves ownership uncertain"
+        );
         assert!(destination.is_dir());
-        drop(file);
     }
 
     #[test]
@@ -740,5 +813,160 @@ mod tests {
             equivalent(&complete, &groupless).unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
+    }
+
+    struct RestoreParent(File);
+    impl Drop for RestoreParent {
+        fn drop(&mut self) {
+            set_policy(&self.0, "D:P(A;OICI;FA;;;OW)", DACL_SECURITY_INFORMATION);
+        }
+    }
+
+    fn restricted_parent(path: &Path, inherited_delete_deny: bool) -> RestoreParent {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        let policy = if inherited_delete_deny {
+            "D:P(D;;0x00000040;;;OW)(D;OI;SD;;;WD)(A;OICI;FA;;;OW)"
+        } else {
+            "D:P(D;;0x00000040;;;OW)(A;OICI;FA;;;OW)"
+        };
+        set_policy(&file, policy, DACL_SECURITY_INFORMATION);
+        RestoreParent(file)
+    }
+
+    #[test]
+    fn undeletable_destination_refuses_before_staging_or_payload() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.bin");
+        fs::write(&path, b"old checkpoint").unwrap();
+        let source = open_native(&path, READ_CONTROL | WRITE_DAC, OPEN_EXISTING, null()).unwrap();
+        set_policy(
+            &source,
+            "D:P(D;;SD;;;WD)(A;;FA;;;OW)",
+            DACL_SECURITY_INFORMATION,
+        );
+        let _restore = restricted_parent(dir.path(), false);
+        for _ in 0..3 {
+            let called = Cell::new(false);
+            let result = super::super::atomic_write(&path, |file| {
+                called.set(true);
+                file.write_all(b"new payload")?;
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(
+                !called.get(),
+                "replace authority must be checked before payload"
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"old checkpoint");
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn inherited_delete_denial_refuses_new_checkpoint_without_leaking_staging() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = restricted_parent(dir.path(), true);
+        let path = dir.path().join("state.bin");
+        for _ in 0..3 {
+            let called = Cell::new(false);
+            let result = super::super::atomic_write(&path, |file| {
+                called.set(true);
+                file.write_all(b"new payload")?;
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(
+                !called.get(),
+                "staging rename authority must be checked before payload"
+            );
+            assert!(!path.exists());
+            assert_eq!(
+                fs::read_dir(dir.path()).unwrap().count(),
+                0,
+                "retained handle removes refused empty stages"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_creation_handle_cleans_payload_when_path_deletion_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = restricted_parent(dir.path(), false);
+        let descriptor = descriptor_from_sddl("D:P(D;;SD;;;WD)(A;;FA;;;OW)");
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        // Isolate the cleanup owner's authority from admission preflights: this
+        // native file deliberately denies a fresh pathname DELETE open.
+        for rename_failure in [false, true] {
+            let named = tempfile::Builder::new()
+                .prefix(".cleanup-probe-")
+                .make_in(dir.path(), |path| {
+                    open_native(
+                        path,
+                        FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | DELETE,
+                        CREATE_NEW,
+                        &attributes,
+                    )
+                })
+                .unwrap();
+            let mut temporary = Temporary::new(named);
+            let stage = temporary.path().to_owned();
+            temporary
+                .as_file_mut()
+                .write_all(b"partial payload")
+                .unwrap();
+            assert!(
+                fs::remove_file(&stage).is_err(),
+                "pathname deletion must actually be denied"
+            );
+            if rename_failure {
+                let blocked = dir.path().join("blocked");
+                fs::create_dir(&blocked).unwrap();
+                assert!(temporary.rename(&blocked).is_err());
+            }
+            // Writer failures remain owned and are cleaned by the handle.
+            // After rename is attempted, preserve even a known diagnostic
+            // stage rather than risk deleting a possibly published file.
+            drop(temporary);
+            assert_eq!(stage.exists(), rename_failure);
+        }
+    }
+
+    #[test]
+    fn rename_then_error_cannot_delete_the_published_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("state.bin");
+        fs::write(&destination, b"old checkpoint").unwrap();
+        let (mut temporary, security) = prepare(&destination, dir.path()).unwrap();
+        temporary
+            .as_file_mut()
+            .write_all(b"new complete checkpoint")
+            .unwrap();
+        finish(security.as_ref(), temporary.as_file()).unwrap();
+        temporary.as_file().sync_all().unwrap();
+        let staging = temporary.path().to_owned();
+        let result = temporary.rename_with(&destination, |from, to| {
+            fs::rename(from, to)?;
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected lost rename acknowledgement",
+            ))
+        });
+        assert!(result.is_err());
+        drop(temporary);
+        assert!(!staging.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"new complete checkpoint");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
