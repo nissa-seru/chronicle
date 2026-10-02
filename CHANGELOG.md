@@ -18,9 +18,9 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 - Metadata checkpoints (`state.bin`, `branches.bin`, and `state-indexes.bin`) now replace the previous file atomically after writing and syncing a same-directory temporary file. An interrupted save leaves the previous complete checkpoint available instead of truncating it. Unix also syncs the containing directory after replacement. Existing file encodings are unchanged.
 
-### Changed
+### Breaking
 
-- State updates now require a registered state and fail before appending if its registration is missing. Opening an old crashed store whose live state-update tail has lost its registration reports a corruption error rather than silently opening with missing state; the log does not contain the strategy needed to restore that metadata.
+- **Rust/Node write APIs:** Register states before updating them, and use `update_state` (or its Node state helpers) for internal `state_update` records. Unregistered state updates and generic appends with this reserved type now fail before writing; custom record producers must choose another type. Existing valid stores keep opening and file encodings are unchanged. Opening an old crashed store whose live state-update tail has lost its registration reports a corruption error rather than silently opening with missing state; the log does not contain the strategy needed to restore that metadata.
 
 ## 0.4.0 — 2026-09-17
 

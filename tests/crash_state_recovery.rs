@@ -463,3 +463,35 @@ fn partially_published_branch_cannot_leak_heads_into_a_new_empty_branch() {
     append(&store, "items", json!(99));
     assert_eq!(value(&store, "items"), json!([99]));
 }
+
+#[test]
+fn generic_appends_cannot_forge_internal_state_updates() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    register(&store, "items", log_strategy());
+    let update = StateUpdateRecord {
+        record_id: RecordId(0),
+        global_sequence: Sequence(1),
+        state_id: "items".into(),
+        prev_update_offset: None,
+        operation: StateOperation::Append(b"42".to_vec()),
+        timestamp: Timestamp(0),
+    };
+    for payload in [b"{}".to_vec(), serde_json::to_vec(&update).unwrap()] {
+        let result = store.append(RecordInput::raw("state_update", payload));
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+        assert_eq!(store.stats().unwrap().record_count, 0);
+        assert_eq!(store.current_branch().head, Sequence(0));
+        assert_eq!(
+            std::fs::metadata(dir.path().join("records.log"))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+    store.sync().unwrap();
+    drop(store);
+    let store = Store::open(config(dir.path())).unwrap();
+    assert_eq!(store.stats().unwrap().record_count, 0);
+    assert_eq!(value(&store, "items"), Value::Null);
+}

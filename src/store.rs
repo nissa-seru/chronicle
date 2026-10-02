@@ -303,7 +303,13 @@ impl Store {
     // --- Record Operations ---
 
     /// Append a record to the current branch.
+    /// The internal `state_update` type is reserved for `update_state`.
     pub fn append(&self, input: RecordInput) -> Result<Record> {
+        if input.record_type == "state_update" {
+            return Err(StoreError::InvalidOperation(
+                "record type 'state_update' is reserved; use update_state instead".into(),
+            ));
+        }
         let _lock = self.write_lock.lock();
 
         let branch = self.branches.current_branch();
