@@ -1828,9 +1828,12 @@ impl Store {
 
     /// Sync all data to disk.
     ///
-    /// This is the durability barrier for record and state updates. On open,
-    /// surviving log records are replayed even without a checkpoint; writes
-    /// lost by the OS or storage device still require this barrier.
+    /// Flush record/state contents and publish metadata checkpoints. On open,
+    /// surviving log records are replayed even without a checkpoint.
+    /// Unix also syncs checkpoint directory entries. Windows flushes contents
+    /// and atomically publishes on the same volume for process interruption;
+    /// it does not guarantee that the latest checkpoint name survives OS or
+    /// device loss because this path provides no namespace durability barrier.
     /// Metadata-only mutations (registration and branch operations) checkpoint
     /// before returning because the record log cannot reconstruct them.
     /// A metadata-checkpoint error retains the mutation in memory. Subsequent

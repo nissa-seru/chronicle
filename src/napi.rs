@@ -1126,9 +1126,11 @@ impl JsStore {
         Ok(links.iter().map(|id| id.0.to_string()).collect())
     }
 
-    /// Persist pending record/state writes and checkpoint metadata.
-    /// Reopen replays complete surviving log records after a process crash;
-    /// use this durability barrier to protect writes against OS/device loss.
+    /// Flush pending record/state contents and publish metadata checkpoints.
+    /// Reopen replays complete surviving log records after a process crash.
+    /// Unix also syncs checkpoint directories. Windows guarantees flushed
+    /// contents and same-volume atomic publication for process interruption,
+    /// not survival of the latest checkpoint name through OS/device loss.
     /// State-registration metadata and branch mutations checkpoint automatically.
     /// After a metadata-checkpoint error, further mutations retry that checkpoint
     /// before proceeding. The tentative in-memory metadata is retained.
