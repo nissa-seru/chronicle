@@ -33,7 +33,7 @@ pub struct ReconciliationReport {
     /// adopt them as ghosts.
     pub orphaned_branch_ids: Vec<BranchId>,
 }
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -698,31 +698,26 @@ impl BranchManager {
 
     /// Save branch index to file.
     pub fn save(&self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)?;
+        crate::atomic_file::atomic_write(&self.path, |file| {
+            // Write magic
+            file.write_all(BRANCH_INDEX_MAGIC)?;
 
-        // Write magic
-        file.write_all(BRANCH_INDEX_MAGIC)?;
+            // Write version
+            file.write_all(&[BRANCH_INDEX_VERSION])?;
 
-        // Write version
-        file.write_all(&[BRANCH_INDEX_VERSION])?;
+            // Write current branch
+            let current_id = *self.current.read();
+            file.write_all(&current_id.0.to_le_bytes())?;
 
-        // Write current branch
-        let current_id = *self.current.read();
-        file.write_all(&current_id.0.to_le_bytes())?;
+            // Serialize index with MessagePack
+            let index = self.index.read();
+            let encoded = rmp_serde::to_vec(&*index)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-        // Serialize index with MessagePack
-        let index = self.index.read();
-        let encoded = rmp_serde::to_vec(&*index)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-        file.write_all(&encoded)?;
-
-        file.sync_all()?;
+            file.write_all(&(encoded.len() as u64).to_le_bytes())?;
+            file.write_all(&encoded)?;
+            Ok(())
+        })?;
         Ok(())
     }
 

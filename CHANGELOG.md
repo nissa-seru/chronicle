@@ -12,6 +12,10 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Metadata checkpoints (`state.bin`, `branches.bin`, and `state-indexes.bin`) now replace the previous file atomically after writing and syncing a same-directory temporary file. An interrupted save leaves the previous complete checkpoint available instead of truncating it. Unix also syncs the containing directory after replacement. Existing file encodings are unchanged.
+
 ## 0.4.0 — 2026-09-17
 
 ### Added
