@@ -28,9 +28,15 @@ pub(crate) fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<
     #[cfg(unix)]
     let directory = File::open(parent)?;
 
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".chronicle-checkpoint-")
-        .tempfile_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".chronicle-checkpoint-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Match OpenOptions' creation mode, including the process umask.
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = builder.tempfile_in(parent)?;
 
     // Retain existing access permissions when replacing a checkpoint.
     match fs::metadata(path) {
@@ -113,6 +119,21 @@ mod tests {
         assert!(result.is_err());
         assert!(path.is_dir());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_checkpoint_uses_normal_creation_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let ordinary = dir.path().join("ordinary");
+        File::create(&ordinary).unwrap();
+        let path = dir.path().join("state.bin");
+        atomic_write(&path, |file| Ok(file.write_all(b"checkpoint")?)).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&ordinary).unwrap().permissions().mode() & 0o777,
+        );
     }
 
     #[cfg(unix)]

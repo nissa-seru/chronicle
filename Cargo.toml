@@ -28,7 +28,7 @@ crc32fast = "1.3"
 tracing = "0.1"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
-tempfile = "3.8"
+tempfile = "3.19"
 
 # NAPI-RS for Node.js bindings (optional)
 napi = { version = "2", default-features = false, features = ["napi8", "serde-json"], optional = true }
