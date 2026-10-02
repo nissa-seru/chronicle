@@ -18,6 +18,7 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 - Reopening a store replays complete state updates after its metadata checkpoint, including snapshot accounting and fresh secondary indexes. State registration, strategy changes, and branch creation/deletion/switching now checkpoint before returning. Store checkpoints are serialized with writes, and branch identities found only in partially published state metadata are reserved against reuse. No on-disk format change; record updates still use `sync()` as their durability barrier against OS or device loss.
 
 - Metadata checkpoints (`state.bin`, `branches.bin`, and `state-indexes.bin`) now replace the previous file atomically after writing and syncing a same-directory temporary file. An interrupted save leaves the previous complete checkpoint available instead of truncating it. Unix also syncs the containing directory after replacement. Existing file encodings are unchanged.
+- Repeated syncs skip metadata whose exact encoded content was already durably published by the same writer and whose destination file identity/metadata is unchanged. Changed checkpoints keep every file and directory durability barrier. Failed publication, reopening, or cloning a writer requires a fresh durable save. The cache retains a digest and file handle rather than a second copy of field-index data.
 
 ### Breaking
 
