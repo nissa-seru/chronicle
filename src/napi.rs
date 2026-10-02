@@ -417,6 +417,7 @@ impl JsStore {
     // --- Records ---
 
     /// Append a record to the store.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append(&self, record_type: String, payload: Buffer) -> Result<JsRecord> {
         let store = self.get_store()?;
@@ -426,6 +427,7 @@ impl JsStore {
     }
 
     /// Append a JSON record.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_json(&self, record_type: String, data: serde_json::Value) -> Result<JsRecord> {
         let store = self.get_store()?;
@@ -1124,7 +1126,10 @@ impl JsStore {
         Ok(links.iter().map(|id| id.0.to_string()).collect())
     }
 
-    /// Sync all pending writes to disk.
+    /// Persist pending record/state writes and checkpoint metadata.
+    /// Reopen replays complete surviving log records after a process crash;
+    /// use this durability barrier to protect writes against OS/device loss.
+    /// State-registration metadata and branch mutations checkpoint automatically.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;
