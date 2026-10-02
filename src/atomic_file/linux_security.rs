@@ -35,19 +35,15 @@ pub(super) fn private_temporary(
 }
 
 fn attribute(file: &File, name: &std::ffi::OsStr) -> io::Result<Option<Vec<u8>>> {
-    match file.get_xattr(name) {
-        Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => Ok(None),
-        result => result,
-    }
+    // ENODATA means this attribute is absent. ENOTSUP is different: the
+    // filesystem cannot establish absence through this API (it might enforce
+    // an ACL scheme we cannot read). Propagate that error rather than guessing.
+    file.get_xattr(name)
 }
 
 fn security_attributes(file: &File) -> io::Result<BTreeMap<OsString, Vec<u8>>> {
     let mut result = BTreeMap::new();
-    let names = match file.list_xattr() {
-        Ok(names) => names,
-        Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => return Ok(result),
-        Err(error) => return Err(error),
-    };
+    let names = file.list_xattr()?;
     for name in names {
         let bytes = name.as_bytes();
         if bytes.starts_with(b"security.") || bytes.starts_with(b"system.") {

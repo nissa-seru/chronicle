@@ -134,8 +134,9 @@ impl Checkpoint {
 /// directory-sync equivalent here. Errors before replacement leave the old
 /// checkpoint intact; a directory-sync error is returned after replacement.
 ///
-/// Linux and macOS replacements preserve ownership, mode and per-file ACLs.
-/// Linux requires an identical initial security label on the staging file and
+/// Replacements preserve ownership, mode, Linux POSIX ACLs and macOS extended
+/// ACLs. Linux requires working ACL/security-xattr APIs and an identical initial
+/// security label on the staging file, and
 /// restores capabilities after writing. Content-bound IMA/EVM signatures and
 /// unfamiliar system ACL xattrs are rejected. Security attributes hidden from
 /// the caller and path-based MAC policy are outside this preservation contract;
