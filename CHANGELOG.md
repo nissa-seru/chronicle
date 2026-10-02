@@ -12,8 +12,13 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
+### Breaking
+
+- **Unix checkpoint publication:** Store directories must permit reading as well as writing and searching, so the directory can be opened and synced after atomic replacement. Grant appropriate directory read access before upgrading stores in writable/searchable-only directories. Missing read access produces a descriptive `PermissionDenied` error before replacement. Existing checkpoint encodings are unchanged.
+
 ### Fixed
 
+- `Store::sync()` now holds the record-write mutex through log sync and checkpoint publication, preventing concurrent syncs from publishing an older checkpoint after a newer one.
 - Metadata checkpoints (`state.bin`, `branches.bin`, and `state-indexes.bin`) now replace the previous file atomically after writing and syncing a same-directory temporary file. An interrupted save leaves the previous complete checkpoint available instead of truncating it. Unix also syncs the containing directory after replacement. Existing file encodings are unchanged.
 - Repeated syncs skip metadata whose exact encoded content was already durably published by the same writer and whose destination file identity/metadata is unchanged. Changed checkpoints keep every file and directory durability barrier. Failed publication, reopening, or cloning a writer requires a fresh durable save. The cache retains a digest and file handle rather than a second copy of field-index data.
 
