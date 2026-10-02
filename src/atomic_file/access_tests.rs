@@ -71,7 +71,10 @@ fn failure_to_restore_ownership_leaves_previous_checkpoint() {
     let result = atomic_write(&path, |file| {
         file.write_all(b"new")?;
         let foreign_owner = File::open("/dev/null")?;
-        super::unix_security::finish(Some(&foreign_owner), file)?;
+        let result = super::unix_security::finish(Some(&foreign_owner), file);
+        assert!(result.is_err());
+        assert_eq!(file.metadata()?.mode() & 0o777, 0);
+        result?;
         Ok(())
     });
     assert!(result.is_err());
