@@ -40,7 +40,7 @@ use crate::types::BranchId;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -621,21 +621,16 @@ impl FieldIndexManager {
     /// a streaming/chunked build would be worth doing before this is used on
     /// multi-GB slots.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        crate::atomic_file::atomic_write(path, |file| {
+            file.write_all(FIELD_INDEX_MAGIC)?;
+            file.write_all(&[FIELD_INDEX_VERSION])?;
 
-        file.write_all(FIELD_INDEX_MAGIC)?;
-        file.write_all(&[FIELD_INDEX_VERSION])?;
-
-        let encoded =
-            rmp_serde::to_vec(self).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-        file.write_all(&encoded)?;
-
-        file.sync_all()?;
+            let encoded =
+                rmp_serde::to_vec(self).map_err(|e| StoreError::Serialization(e.to_string()))?;
+            file.write_all(&(encoded.len() as u64).to_le_bytes())?;
+            file.write_all(&encoded)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -706,7 +701,7 @@ impl FieldIndexManager {
     /// reports right now. `load()` only rejects a file that fails to parse
     /// — it has no way to know whether the *content* it successfully parsed
     /// is still current, since `state.bin` and `state-indexes.bin` are
-    /// separate, non-atomically-written files (`save()` writes `state.bin`
+    /// separately published files (`save()` writes `state.bin`
     /// first and swallows a later field-index save failure). A crash in
     /// that window, or a structurally-valid-but-older `state-indexes.bin`
     /// restored from a backup, parses fine but is stale relative to the

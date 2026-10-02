@@ -15,7 +15,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -1261,29 +1261,23 @@ impl StateManager {
 
     /// Save state index to file.
     pub fn save(&self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)?;
+        crate::atomic_file::atomic_write(&self.path, |file| {
+            // Write magic
+            file.write_all(STATE_INDEX_MAGIC)?;
 
-        // Write magic
-        file.write_all(STATE_INDEX_MAGIC)?;
+            // Write version
+            file.write_all(&[STATE_INDEX_VERSION])?;
 
-        // Write version
-        file.write_all(&[STATE_INDEX_VERSION])?;
+            // Serialize index with MessagePack
+            let index = self.index.read();
+            let encoded =
+                rmp_serde::to_vec(&*index).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-        // Serialize index with MessagePack
-        let index = self.index.read();
-        let encoded =
-            rmp_serde::to_vec(&*index).map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        // Write length and data
-        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-        file.write_all(&encoded)?;
-
-        file.sync_all()?;
-        drop(index);
+            // Write length and data
+            file.write_all(&(encoded.len() as u64).to_le_bytes())?;
+            file.write_all(&encoded)?;
+            Ok(())
+        })?;
 
         // Field indexes live in their own file (`state-indexes.bin`), kept
         // separate from `state.bin`'s format on purpose: `state.bin` missing
