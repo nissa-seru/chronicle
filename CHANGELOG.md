@@ -20,7 +20,8 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ### Breaking
 
-- **Rust/Node write APIs:** Register states before updating them, and use `update_state` (or its Node state helpers) for internal `state_update` records. Unregistered state updates and generic appends with this reserved type now fail before writing; custom record producers must choose another type. Existing valid stores keep opening and file encodings are unchanged. Opening an old crashed store whose live state-update tail has lost its registration reports a corruption error rather than silently opening with missing state; the log does not contain the strategy needed to restore that metadata.
+- **Rust/Node write APIs:** Register states before updating them, and use `update_state` (or its Node state helpers) for internal `state_update` records. Unregistered state updates and generic appends with this reserved type now fail before writing; custom record producers must choose another type.
+- **Existing stores:** Previously accepted custom records named `state_update` can fail reopen when recovery reaches them. Migrate those custom records using the previous version before upgrading. File encodings are unchanged. Opening an old crashed store whose live state-update tail has lost its registration reports a corruption error rather than silently opening with missing state; the log does not contain the strategy needed to restore that metadata.
 
 ## 0.4.0 — 2026-09-17
 
