@@ -6,8 +6,9 @@
 //! Readonly destinations fail before staging. Replacing an existing checkpoint
 //! requires READ_CONTROL, DELETE/replace access, and the ability to create its
 //! owner/group and native descriptor. Staging deletion/rename access is checked
-//! before payload; failure cleanup uses the retained DELETE-authorized creation
-//! handle. Inability to preserve controls is an error, not a mode-only fallback.
+//! before payload; pre-publication failure cleanup uses the retained
+//! DELETE-authorized creation handle. Once rename is attempted, an error leaves
+//! ownership uncertain and the file is preserved for diagnosis. Inability to preserve controls is an error, not a mode-only fallback.
 //! Concurrent external security/path changes and path-based policy equivalence
 //! are outside this single-writer per-file contract. Staging names need the same
 //! external policy coverage as checkpoint names.
@@ -171,8 +172,23 @@ impl Temporary {
     }
 
     fn rename(&mut self, path: &Path) -> io::Result<()> {
-        std::fs::rename(&self.path, path)?;
+        self.rename_with(path, |from, to| std::fs::rename(from, to))
+    }
+
+    fn rename_with(
+        &mut self,
+        path: &Path,
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        // From this point an error can leave publication uncertain. Our handle
+        // may already name the published checkpoint, so it must never delete
+        // the file in response to a failed acknowledgement.
         self.cleanup = false;
+        if let Err(error) = rename(&self.path, path) {
+            tracing::warn!(error = %error, staging = %self.path.display(), destination = %path.display(),
+                "Windows checkpoint rename outcome is uncertain; preserving the file, which may remain at the staging name or be published");
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -756,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_publication_keeps_staging_cleanup_armed() {
+    fn rename_attempt_error_preserves_diagnostic_staging() {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("state.bin");
         let (mut temporary, _) = prepare(&destination, dir.path()).unwrap();
@@ -765,7 +781,10 @@ mod tests {
         assert!(temporary.rename(&destination).is_err());
         assert!(cleanup.exists());
         drop(temporary);
-        assert!(!cleanup.exists());
+        assert!(
+            cleanup.exists(),
+            "an attempted publication leaves ownership uncertain"
+        );
         assert!(destination.is_dir());
     }
 
@@ -916,10 +935,38 @@ mod tests {
                 fs::create_dir(&blocked).unwrap();
                 assert!(temporary.rename(&blocked).is_err());
             }
-            // Models writer failure or rename failure: the retained DELETE
-            // handle removes the payload even though TempPath could not.
+            // Writer failures remain owned and are cleaned by the handle.
+            // After rename is attempted, preserve even a known diagnostic
+            // stage rather than risk deleting a possibly published file.
             drop(temporary);
-            assert!(!stage.exists());
+            assert_eq!(stage.exists(), rename_failure);
         }
+    }
+
+    #[test]
+    fn rename_then_error_cannot_delete_the_published_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("state.bin");
+        fs::write(&destination, b"old checkpoint").unwrap();
+        let (mut temporary, security) = prepare(&destination, dir.path()).unwrap();
+        temporary
+            .as_file_mut()
+            .write_all(b"new complete checkpoint")
+            .unwrap();
+        finish(security.as_ref(), temporary.as_file()).unwrap();
+        temporary.as_file().sync_all().unwrap();
+        let staging = temporary.path().to_owned();
+        let result = temporary.rename_with(&destination, |from, to| {
+            fs::rename(from, to)?;
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected lost rename acknowledgement",
+            ))
+        });
+        assert!(result.is_err());
+        drop(temporary);
+        assert!(!staging.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"new complete checkpoint");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
