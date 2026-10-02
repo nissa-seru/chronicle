@@ -85,6 +85,9 @@ impl Descriptor {
         let mut sid = null_mut();
         let mut defaulted = 0;
         check(unsafe { GetSecurityDescriptorOwner(self.0, &mut sid, &mut defaulted) })?;
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return Err(unsupported("checkpoint descriptor has no valid owner SID"));
+        }
         Ok(sid)
     }
 
@@ -92,6 +95,9 @@ impl Descriptor {
         let mut sid = null_mut();
         let mut defaulted = 0;
         check(unsafe { GetSecurityDescriptorGroup(self.0, &mut sid, &mut defaulted) })?;
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return Err(unsupported("checkpoint descriptor has no valid group SID"));
+        }
         Ok(sid)
     }
 
@@ -399,7 +405,7 @@ mod tests {
     use std::io::Write;
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 
-    fn set_policy(file: &File, sddl: &str, parts: u32) {
+    fn descriptor_from_sddl(sddl: &str) -> Descriptor {
         let mut descriptor = null_mut();
         let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
         check(unsafe {
@@ -411,7 +417,11 @@ mod tests {
             )
         })
         .unwrap();
-        let descriptor = Descriptor(descriptor);
+        Descriptor(descriptor)
+    }
+
+    fn set_policy(file: &File, sddl: &str, parts: u32) {
+        let descriptor = descriptor_from_sddl(sddl);
         use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
         let flags = if parts & DACL_SECURITY_INFORMATION != 0 {
             parts
@@ -703,5 +713,32 @@ mod tests {
         assert!(!cleanup.exists());
         assert!(destination.is_dir());
         drop(file);
+    }
+
+    #[test]
+    fn absent_owner_or_group_is_rejected_before_sid_comparison() {
+        // Valid native descriptors may omit either identity. Accessor success
+        // alone must not turn that optional pointer into an EqualSid argument.
+        let ownerless = descriptor_from_sddl("G:SYD:P");
+        let groupless = descriptor_from_sddl("O:SYD:P");
+        let complete = descriptor_from_sddl("O:SYG:SYD:P");
+        assert_eq!(
+            ownerless.owner().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(ownerless.group().is_ok());
+        assert!(groupless.owner().is_ok());
+        assert_eq!(
+            groupless.group().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            equivalent(&ownerless, &complete).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            equivalent(&complete, &groupless).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 }
