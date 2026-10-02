@@ -4,12 +4,14 @@
 mod access_tests;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_security;
+#[cfg(windows)]
+mod windows_security;
 
 use crate::error::Result;
 use parking_lot::Mutex;
 use same_file::Handle;
 use sha2::{Digest, Sha256};
-#[cfg(any(test, windows))]
+#[cfg(test)]
 use std::fs;
 use std::fs::{File, Metadata};
 use std::io::{self, Write};
@@ -145,6 +147,12 @@ impl Checkpoint {
 /// Replacing an existing Unix checkpoint requires reading its security metadata
 /// through an open file and permission to restore its ownership and ACL.
 ///
+/// Windows preserves source owner/group, native DACL/ACE flags and integrity
+/// policy through descriptor-at-creation verification before any payload bytes.
+/// Audit-only SACLs are outside the preservation contract; other enforcement
+/// SACL components, EFS/reparse files, and readonly destinations are rejected.
+/// See windows_security for required access and external-policy boundaries.
+///
 /// Unique temporary names allow concurrent callers to write independently.
 /// A process killed before replacement can leave an unused temporary file;
 /// loaders only open the final checkpoint name.
@@ -164,26 +172,25 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
     let (mut temporary, source) = unix_security::prepare(path, parent)?;
 
     #[cfg(windows)]
-    let mut temporary = {
-        let temporary = tempfile::Builder::new()
-            .prefix(".chronicle-checkpoint-")
-            .tempfile_in(parent)?;
-        // Windows native descriptor preservation is implemented separately.
-        match fs::metadata(path) {
-            Ok(metadata) => temporary
-                .as_file()
-                .set_permissions(metadata.permissions())?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        temporary
-    };
+    let (mut temporary, security) = windows_security::prepare(path, parent)?;
 
     write(temporary.as_file_mut())?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     unix_security::finish(source.as_ref(), temporary.as_file())?;
+    #[cfg(windows)]
+    windows_security::finish(security.as_ref(), temporary.as_file())?;
     temporary.as_file().sync_all()?;
+    #[cfg(not(windows))]
     let published = temporary.persist(path).map_err(|error| error.error)?;
+    #[cfg(windows)]
+    let published = {
+        // tempfile::persist clears Windows attributes through a new path-based
+        // access check. This native same-volume rename retains the controls and
+        // attributes already verified through our handle.
+        let (file, temporary_path) = temporary.into_parts();
+        std::fs::rename(&temporary_path, path)?;
+        file
+    };
 
     #[cfg(unix)]
     directory.sync_all()?;
