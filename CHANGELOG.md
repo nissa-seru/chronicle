@@ -15,6 +15,7 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 ### Fixed
 
 - Metadata checkpoints (`state.bin`, `branches.bin`, and `state-indexes.bin`) now replace the previous file atomically after writing and syncing a same-directory temporary file. An interrupted save leaves the previous complete checkpoint available instead of truncating it. Unix also syncs the containing directory after replacement. Existing file encodings are unchanged.
+- Repeated syncs skip metadata whose exact encoded content was already durably published by the same writer and whose destination file identity/metadata is unchanged. Changed checkpoints keep every file and directory durability barrier. Failed publication, reopening, or cloning a writer requires a fresh durable save. The cache retains a digest and file handle rather than a second copy of field-index data.
 
 ## 0.4.0 — 2026-09-17
 

@@ -4,6 +4,7 @@
 use chronicle::{
     FieldIndexKind, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
 };
+use same_file::Handle;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -81,6 +82,68 @@ fn assert_published_without_truncating(name: &str) {
         ),
         Some(vec![0, 1]),
     );
+}
+
+#[test]
+fn sync_only_republishes_metadata_that_changed() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    store
+        .register_state(StateRegistration {
+            id: "messages".into(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+    append(&store, 10);
+    store
+        .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
+        .unwrap();
+    store.sync().unwrap();
+    let names = ["state.bin", "state-indexes.bin", "branches.bin"];
+    let identities = || names.map(|name| Handle::from_path(path.join(name)).unwrap());
+    let first = identities();
+
+    store.sync().unwrap();
+    assert_eq!(
+        identities(),
+        first,
+        "unchanged sync must not republish metadata"
+    );
+
+    store
+        .append(chronicle::RecordInput::raw("message", b"raw".to_vec()))
+        .unwrap();
+    store.sync().unwrap();
+    let raw = identities();
+    assert_eq!(raw[0], first[0], "raw append leaves state metadata alone");
+    assert_eq!(raw[1], first[1], "raw append leaves field indexes alone");
+    assert_ne!(raw[2], first[2], "the new branch head must persist");
+
+    append(&store, 20);
+    store.sync().unwrap();
+    let state = identities();
+    for i in 0..names.len() {
+        assert_ne!(state[i], raw[i], "{} changed", names[i]);
+    }
+    store.sync().unwrap();
+    assert_eq!(identities(), state);
+
+    drop(store);
+    let reopened = Store::open(config(&path)).unwrap();
+    // Loading bytes is not a durability acknowledgement from this writer.
+    reopened.sync().unwrap();
+    let loaded = identities();
+    for i in 0..names.len() {
+        assert_ne!(loaded[i], state[i], "{} first save after load", names[i]);
+    }
+    reopened.sync().unwrap();
+    assert_eq!(identities(), loaded);
+    assert_eq!(reopened.get_state_len("messages").unwrap(), Some(2));
 }
 
 #[test]
