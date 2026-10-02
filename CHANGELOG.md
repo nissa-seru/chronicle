@@ -12,9 +12,13 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
+### Breaking
+
+- **Windows checkpoint writers:** Replacement now requires reading and recreating the existing native owner/group, DACL, and integrity policy. Readonly files, EFS, reparse points, unsupported enforcement SACL components, or inaccessible/unpreservable descriptors are refused before publication. Deploy only where these controls can be preserved; retain unsupported policy rather than stripping it to upgrade. Audit-only SACL preservation and path-based policy equivalence are outside this per-file contract, so staging names need appropriate external policy coverage. Checkpoint encodings and earlier-version readability are unchanged.
+
 ### Fixed
 
-- Windows checkpoint replacement now supplies and verifies native owner/group, DACL (including inherited ACEs and OWNER RIGHTS), and integrity-label policy before any payload is written. It preserves protection bits while permitting Windows to normalize automatic-inheritance bookkeeping. Readonly files, EFS, reparse points, unsupported enforcement SACL components, or inaccessible/unpreservable descriptors fail before publication. Audit-only SACLs and path-based policy are outside this per-file contract; staging names must have appropriate external policy coverage. Checkpoint encodings are unchanged.
+- Windows checkpoints verify source-equivalent native controls at staging creation before any payload bytes, including OWNER RIGHTS and integrity-label policy. Protection and ACE flags are preserved; Windows may normalize automatic-inheritance bookkeeping for regular files.
 - Metadata checkpoints (`state.bin`, `branches.bin`, and `state-indexes.bin`) now replace the previous file atomically after writing and syncing a same-directory temporary file. An interrupted save leaves the previous complete checkpoint available instead of truncating it. Unix also syncs the containing directory after replacement. Existing file encodings are unchanged.
 - Repeated syncs skip metadata whose exact encoded content was already durably published by the same writer and whose destination file identity/metadata is unchanged. Changed checkpoints keep every file and directory durability barrier. Failed publication, reopening, or cloning a writer requires a fresh durable save. The cache retains a digest and file handle rather than a second copy of field-index data.
 
