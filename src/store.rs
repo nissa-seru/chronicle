@@ -2308,6 +2308,32 @@ mod tests {
     }
 
     #[test]
+    fn sync_waits_for_active_writer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::create(test_config(&dir)).unwrap());
+        store.sync().unwrap();
+        let writer = store.write_lock.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let sync_store = Arc::clone(&store);
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(sync_store.sync()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let while_locked = finished_rx.recv_timeout(Duration::from_millis(250));
+        drop(writer);
+        assert!(
+            matches!(while_locked, Err(mpsc::RecvTimeoutError::Timeout)),
+            "sync passed an active writer: {while_locked:?}"
+        );
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
     fn test_state_operations() {
         let dir = TempDir::new().unwrap();
         let store = Store::create(test_config(&dir)).unwrap();
