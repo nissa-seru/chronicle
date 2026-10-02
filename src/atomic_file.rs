@@ -1,10 +1,17 @@
 //! Publish one metadata checkpoint without truncating its previous version.
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod access_tests;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix_security;
+
 use crate::error::Result;
 use parking_lot::Mutex;
 use same_file::Handle;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, Metadata};
+#[cfg(any(test, windows))]
+use std::fs;
+use std::fs::{File, Metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -127,9 +134,19 @@ impl Checkpoint {
 /// directory-sync equivalent here. Errors before replacement leave the old
 /// checkpoint intact; a directory-sync error is returned after replacement.
 ///
+/// Linux and macOS replacements preserve ownership, mode and per-file ACLs.
+/// Linux requires an identical initial security label on the staging file and
+/// restores capabilities after writing. Content-bound IMA/EVM signatures and
+/// unfamiliar system ACL xattrs are rejected. Security attributes hidden from
+/// the caller and path-based MAC policy are outside this preservation contract;
+/// store policy must cover the staging names as well as the final names.
+/// Replacing an existing Unix checkpoint requires reading its security metadata
+/// through an open file and permission to restore its ownership and ACL.
+///
 /// Unique temporary names allow concurrent callers to write independently.
 /// A process killed before replacement can leave an unused temporary file;
 /// loaders only open the final checkpoint name.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<File> {
     // A bare relative filename has an empty parent, which means the current
     // directory rather than a directory that can be opened by its empty name.
@@ -141,26 +158,28 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
     #[cfg(unix)]
     let directory = File::open(parent)?;
 
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".chronicle-checkpoint-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Match OpenOptions' creation mode, including the process umask.
-        builder.permissions(fs::Permissions::from_mode(0o666));
-    }
-    let mut temporary = builder.tempfile_in(parent)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let (mut temporary, source) = unix_security::prepare(path, parent)?;
 
-    // Retain existing access permissions when replacing a checkpoint.
-    match fs::metadata(path) {
-        Ok(metadata) => temporary
-            .as_file()
-            .set_permissions(metadata.permissions())?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    #[cfg(windows)]
+    let mut temporary = {
+        let temporary = tempfile::Builder::new()
+            .prefix(".chronicle-checkpoint-")
+            .tempfile_in(parent)?;
+        // Windows native descriptor preservation is implemented separately.
+        match fs::metadata(path) {
+            Ok(metadata) => temporary
+                .as_file()
+                .set_permissions(metadata.permissions())?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        temporary
+    };
 
     write(temporary.as_file_mut())?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    unix_security::finish(source.as_ref(), temporary.as_file())?;
     temporary.as_file().sync_all()?;
     let published = temporary.persist(path).map_err(|error| error.error)?;
 
@@ -168,6 +187,15 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
     directory.sync_all()?;
 
     Ok(published)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn atomic_write(_path: &Path, _write: impl FnOnce(&mut File) -> Result<()>) -> Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic checkpoint access-control preservation is unsupported on this platform",
+    )
+    .into())
 }
 
 #[cfg(test)]
