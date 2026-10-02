@@ -362,6 +362,18 @@ impl BranchManager {
         report
     }
 
+    /// Reserve an identity that reached state.bin before branches.bin. It may
+    /// have inherited state heads without ever appending a record of its own,
+    /// so log-only reconciliation cannot prevent its accidental reuse.
+    pub(crate) fn reserve_id_after(&self, id: BranchId) -> Result<()> {
+        let next = id.0.checked_add(1).ok_or_else(|| {
+            StoreError::Corruption("branch identity space exhausted in state metadata".into())
+        })?;
+        let mut index = self.index.write();
+        index.next_id = index.next_id.max(next);
+        Ok(())
+    }
+
     /// Update the head of a branch.
     pub fn update_head(&self, branch_id: BranchId, new_head: Sequence) -> Result<()> {
         let mut index = self.index.write();

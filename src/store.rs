@@ -190,6 +190,14 @@ impl Store {
             );
         }
 
+        // A crash between the state and branch checkpoint publications can
+        // leave copied heads for an unpublished branch with no log records.
+        // Reserve those identities too, so a new empty branch cannot inherit
+        // the abandoned branch's state through an accidentally reused ID.
+        if let Some(id) = state.max_branch_id() {
+            branches.reserve_id_after(id)?;
+        }
+
         // Fail loudly if state metadata points past the (possibly truncated)
         // valid log — its offsets would otherwise dereference to garbage.
         state.validate_offsets(log.size())?;
@@ -204,11 +212,44 @@ impl Store {
             );
         }
 
-        // Rebuild index from log (O(N) startup, but O(1) sync)
-        let index = RecordIndex::rebuild_from_log(config.path.join("records.idx"), &log)?;
-
-        // Connect state manager to log for disk-based traversal
+        // Connect the state manager for disk-based chain traversal.
         state.set_log(Arc::clone(&log));
+
+        // Recover the state-update tail while rebuilding the record index.
+        // The checkpoint covers all updates through its latest head, including
+        // updates on other branches. Keep this boundary fixed during replay.
+        let checkpoint = state.checkpoint_offset();
+        let index = RecordIndex::rebuild_from_log_with(
+            config.path.join("records.idx"),
+            &log,
+            |offset, record| {
+                if record.record_type != "state_update"
+                    || checkpoint.is_some_and(|saved| offset <= saved)
+                    || branches.get_branch_by_id(record.branch).is_none()
+                {
+                    return Ok(());
+                }
+
+                let update = StateUpdateRecord::decode(record)?;
+                if state.get_strategy(&update.state_id).is_none() {
+                    return Err(StoreError::Corruption(format!(
+                        "cannot replay state '{}' at log offset {}: registration is missing \
+                         from state.bin; restore the state metadata from a backup",
+                        update.state_id, offset
+                    )));
+                }
+                let previous = state.get_head(record.branch, &update.state_id)
+                    .map(|head| head.head_offset);
+                if update.prev_update_offset != previous {
+                    return Err(StoreError::Corruption(format!(
+                        "cannot replay state '{}' at log offset {}: previous offset {:?} \
+                         does not match checkpoint/replayed head {:?}",
+                        update.state_id, offset, update.prev_update_offset, previous
+                    )));
+                }
+                state.record_update(record.branch, &update.state_id, offset, &update.operation)
+            },
+        )?;
 
         Ok(Self {
             config,
@@ -393,9 +434,12 @@ impl Store {
 
     // --- State Operations ---
 
-    /// Register a new state.
+    /// Register a new state and persist its strategy before returning.
+    /// The log cannot reconstruct a lost registration after a crash.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
-        self.state.register_state(registration)
+        let _lock = self.write_lock.lock();
+        self.state.register_state(registration)?;
+        self.sync_locked()
     }
 
     /// Update the strategy parameters of an already-registered state (same
@@ -407,7 +451,9 @@ impl Store {
         state_id: &str,
         strategy: crate::types::StateStrategy,
     ) -> Result<()> {
-        self.state.update_state_strategy(state_id, strategy)
+        let _lock = self.write_lock.lock();
+        self.state.update_state_strategy(state_id, strategy)?;
+        self.sync_locked()
     }
 
     /// Update a state and record it.
@@ -492,6 +538,10 @@ impl Store {
         F: FnOnce(RecordId, Sequence) -> Result<StateOperation>,
     {
         let _lock = self.write_lock.lock();
+
+        if self.state.get_strategy(state_id).is_none() {
+            return Err(StoreError::StateNotRegistered(state_id.to_string()));
+        }
 
         let branch = self.branches.current_branch();
         let prev_update_offset = self.state.get_head(branch.id, state_id).map(|h| h.head_offset);
@@ -1607,8 +1657,9 @@ impl Store {
 
     // --- Branch Operations ---
 
-    /// Create a new branch from the current branch head.
+    /// Create a new branch from the current branch head and checkpoint it.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
+        let _lock = self.write_lock.lock();
         let parent = if let Some(from_name) = from {
             self.branches.get_branch(from_name).ok_or_else(|| {
                 StoreError::BranchNotFound(from_name.to_string())
@@ -1623,19 +1674,25 @@ impl Store {
         // Copy state chain heads from parent to child
         self.state.copy_heads_for_branch(parent.id, new_branch.id);
 
+        // Persist copied state heads before publishing the branch identity.
+        self.sync_locked()?;
+
         // Broadcast branch created
         self.subscriptions.broadcast_branch_created(&new_branch, Some(parent_name));
 
         Ok(new_branch)
     }
 
-    /// Create a branch without copying state from parent.
+    /// Create and checkpoint a branch without copying state from parent.
     /// This is useful for creating branches with custom state (e.g., time-travel branching).
     pub fn create_empty_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
+        let _lock = self.write_lock.lock();
         let parent_name = from.map(|n| n.to_string()).or_else(|| {
             Some(self.branches.current_branch().name.clone())
         });
         let new_branch = self.branches.create_branch(name, from)?;
+
+        self.sync_locked()?;
 
         // Broadcast branch created
         self.subscriptions.broadcast_branch_created(&new_branch, parent_name);
@@ -1644,7 +1701,7 @@ impl Store {
         Ok(new_branch)
     }
 
-    /// Create a branch at a specific sequence (time-travel branching).
+    /// Create and checkpoint a branch at a specific sequence (time-travel branching).
     ///
     /// This creates a new branch that starts with the state as it existed at the
     /// given sequence on the parent branch. The new branch's state heads point to
@@ -1656,6 +1713,7 @@ impl Store {
     /// * `from` - Parent branch name to branch from
     /// * `at` - Sequence number on parent to branch at (must be <= parent's head)
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
+        let _lock = self.write_lock.lock();
         let parent = self
             .branches
             .get_branch(from)
@@ -1674,15 +1732,19 @@ impl Store {
             }
         }
 
+        self.sync_locked()?;
         self.subscriptions
             .broadcast_branch_created(&new_branch, Some(from.to_string()));
 
         Ok(new_branch)
     }
 
-    /// Switch to a different branch.
+    /// Switch to a different branch and checkpoint the current-branch pointer.
     pub fn switch_branch(&self, name: &str) -> Result<Branch> {
-        self.branches.switch_branch(name)
+        let _lock = self.write_lock.lock();
+        let branch = self.branches.switch_branch(name)?;
+        self.sync_locked()?;
+        Ok(branch)
     }
 
     /// Get the current branch.
@@ -1695,9 +1757,11 @@ impl Store {
         self.branches.list_branches()
     }
 
-    /// Delete a branch.
+    /// Delete a branch and checkpoint the deletion.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
+        let _lock = self.write_lock.lock();
         self.branches.delete_branch(name)?;
+        self.sync_locked()?;
 
         // Broadcast branch deleted
         self.subscriptions.broadcast_branch_deleted(name);
@@ -1722,9 +1786,21 @@ impl Store {
 
     /// Sync all data to disk.
     ///
-    /// This is O(1) - only syncs the log file and small metadata files.
-    /// The record index is not persisted; it's rebuilt from the log on startup.
+    /// This is the durability barrier for record and state updates. On open,
+    /// surviving log records are replayed even without a checkpoint; writes
+    /// lost by the OS or storage device still require this barrier.
+    /// Metadata-only mutations (registration and branch operations) checkpoint
+    /// before returning because the record log cannot reconstruct them.
+    /// The record index is rebuilt on startup; checkpoint cost depends on
+    /// state heads, branch metadata, and any registered field indexes.
     pub fn sync(&self) -> Result<()> {
+        let _lock = self.write_lock.lock();
+        self.sync_locked()
+    }
+
+    /// Call only while holding write_lock, so a state head cannot reach disk
+    /// ahead of its log record and branch/state checkpoints cannot interleave.
+    fn sync_locked(&self) -> Result<()> {
         // Sync the append-only log (O(1) - just fsync)
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)

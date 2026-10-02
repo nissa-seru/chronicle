@@ -12,6 +12,14 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Reopening a store replays complete state updates after its metadata checkpoint, including snapshot accounting and fresh secondary indexes. State registration, strategy changes, and branch creation/deletion/switching now checkpoint before returning. Store checkpoints are serialized with writes, and branch identities found only in partially published state metadata are reserved against reuse. No on-disk format change; record updates still use `sync()` as their durability barrier against OS or device loss.
+
+### Changed
+
+- State updates now require a registered state and fail before appending if its registration is missing. Opening an old crashed store whose live state-update tail has lost its registration reports a corruption error rather than silently opening with missing state; the log does not contain the strategy needed to restore that metadata.
+
 ## 0.4.0 — 2026-09-17
 
 ### Added
