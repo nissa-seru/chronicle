@@ -57,6 +57,10 @@ pub(super) fn finish(source: Option<&File>, destination: &File) -> io::Result<()
     // Changing ownership can clear mode bits and security attributes. Do it
     // first, while the file is still private. Failure keeps the old checkpoint.
     if current.uid() != metadata.uid() || current.gid() != metadata.gid() {
+        // Keep the staging mode from becoming a grant to the restored owner
+        // before its real ACL and mode are installed. Our open descriptor
+        // still permits the remaining operations.
+        destination.set_permissions(fs::Permissions::from_mode(0))?;
         // SAFETY: the borrowed descriptor remains open for the call.
         if unsafe { libc::fchown(destination.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
             return Err(io::Error::last_os_error());
