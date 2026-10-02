@@ -196,14 +196,7 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
     #[cfg(not(windows))]
     let published = temporary.persist(path).map_err(|error| error.error)?;
     #[cfg(windows)]
-    let published = {
-        // tempfile::persist clears Windows attributes through a new path-based
-        // access check. This native same-volume rename retains the controls and
-        // attributes already verified through our handle.
-        let (file, temporary_path) = temporary.into_parts();
-        std::fs::rename(&temporary_path, path)?;
-        file
-    };
+    let published = windows_security::publish(temporary, path)?;
 
     #[cfg(unix)]
     directory.sync_all()?;

@@ -376,6 +376,22 @@ pub(super) fn finish(security: Option<&Security>, temporary: &File) -> io::Resul
     Ok(())
 }
 
+/// Publish without tempfile::persist's path-based attribute reset. The file
+/// was created without FILE_ATTRIBUTE_TEMPORARY and already synced by caller.
+pub(super) fn publish(temporary: NamedTempFile, path: &Path) -> io::Result<File> {
+    let (file, mut temporary_path) = temporary.into_parts();
+    publish_path(&mut temporary_path, path)?;
+    Ok(file)
+}
+
+fn publish_path(temporary: &mut tempfile::TempPath, path: &Path) -> io::Result<()> {
+    std::fs::rename(&temporary, path)?;
+    // Our file no longer owns this staging name. A future reuse belongs to
+    // somebody else, so dropping the guard must not delete that name.
+    temporary.disable_cleanup(true);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +672,36 @@ mod tests {
             converted,
             expected.encode_utf16().chain(Some(0)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn successful_publication_disarms_cleanup_of_the_old_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let (file, mut old_path) = temporary.into_parts();
+        let reused = old_path.to_path_buf();
+        let destination = dir.path().join("state.bin");
+        publish_path(&mut old_path, &destination).unwrap();
+        fs::write(&reused, b"another writer owns this name").unwrap();
+        drop(old_path);
+        assert_eq!(fs::read(&reused).unwrap(), b"another writer owns this name");
+        assert!(destination.exists());
+        drop(file);
+    }
+
+    #[test]
+    fn failed_publication_keeps_staging_cleanup_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let (file, mut old_path) = temporary.into_parts();
+        let cleanup = old_path.to_path_buf();
+        let destination = dir.path().join("state.bin");
+        fs::create_dir(&destination).unwrap();
+        assert!(publish_path(&mut old_path, &destination).is_err());
+        assert!(cleanup.exists());
+        drop(old_path);
+        assert!(!cleanup.exists());
+        assert!(destination.is_dir());
+        drop(file);
     }
 }
