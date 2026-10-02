@@ -72,11 +72,34 @@ fn check(result: c_int) -> io::Result<()> {
     }
 }
 
+fn reject_authorization_label(file: &File, name: &std::ffi::CStr) -> io::Result<()> {
+    // SAFETY: the descriptor and NUL-terminated name remain live; a zero-sized
+    // query with a null buffer asks only whether the attribute exists.
+    let size =
+        unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), ptr::null_mut(), 0, 0, 0) };
+    if size >= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "checkpoint carries a macOS authorization label that cannot be preserved",
+        ));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOATTR) {
+        Ok(())
+    } else {
+        // An unsupported/denied metadata query is not proof of absence.
+        Err(error)
+    }
+}
+
 pub(super) fn private_temporary(
     builder: &tempfile::Builder<'_, '_>,
     parent: &Path,
-    _source: &File,
+    source: &File,
 ) -> io::Result<NamedTempFile> {
+    // com.apple.macl carries app authorization outside the filesec ACL. There
+    // is no supported ordinary-file API here for preserving that policy.
+    reject_authorization_label(source, c"com.apple.macl")?;
     let security = Security::new()?;
     // A mode alone does not suppress inherited Darwin ACL grants. Install an
     // empty non-inheriting ACL AT CREATION, before anyone can open the file.
@@ -102,7 +125,7 @@ pub(super) fn private_temporary(
             ptr::from_ref(&acl.0).cast(),
         ))?;
     }
-    builder.make_in(parent, |path| {
+    let temporary = builder.make_in(parent, |path| {
         let path = CString::new(path.as_os_str().as_bytes())?;
         // SAFETY: the string and security object remain live for this call.
         let fd = unsafe {
@@ -118,10 +141,14 @@ pub(super) fn private_temporary(
             // SAFETY: openx_np returned a fresh owned descriptor.
             Ok(unsafe { File::from_raw_fd(fd) })
         }
-    })
+    })?;
+    reject_authorization_label(temporary.as_file(), c"com.apple.macl")?;
+    Ok(temporary)
 }
 
 pub(super) fn copy_access(source: &File, destination: &File) -> io::Result<()> {
+    reject_authorization_label(source, c"com.apple.macl")?;
+    reject_authorization_label(destination, c"com.apple.macl")?;
     let security = Security::new()?;
     // SAFETY: stat's layout matches Darwin's inode64 API; both descriptors and
     // the opaque security allocation remain live throughout these calls.
@@ -144,5 +171,27 @@ pub(super) fn copy_access(source: &File, destination: &File) -> io::Result<()> {
             ))?;
         }
         check(fchmodx_np(destination.as_raw_fd(), security.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorization_label_gate_distinguishes_absence_from_presence() {
+        let file = tempfile::tempfile().unwrap();
+        // Exercise the native xattr existence query with an ordinary attribute:
+        // creating real MACL policy can require OS-managed user consent.
+        let name = c"com.chronicle.test-authorization";
+        reject_authorization_label(&file, name).unwrap();
+        // Even a zero-length value is presence, not an absent label.
+        let result =
+            unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), ptr::null(), 0, 0, 0) };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        assert_eq!(
+            reject_authorization_label(&file, name).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 }

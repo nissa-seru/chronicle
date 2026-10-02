@@ -141,6 +141,7 @@ impl Checkpoint {
 /// unfamiliar system ACL xattrs are rejected. Security attributes hidden from
 /// the caller and path-based MAC policy are outside this preservation contract;
 /// store policy must cover the staging names as well as the final names.
+/// macOS authorization labels (com.apple.macl) are rejected rather than lost.
 /// Replacing an existing Unix checkpoint requires reading its security metadata
 /// through an open file and permission to restore its ownership and ACL.
 ///
