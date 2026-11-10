@@ -12,7 +12,7 @@ use crate::{
     StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use napi::bindgen_prelude::*;
-use napi::{Env, JsDeferred, JsObject};
+use napi::{Env, JsDeferred, JsFunction, JsObject, JsUnknown};
 use napi_derive::napi;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -37,6 +37,22 @@ fn coded(code: ErrorCode, reason: impl ToString) -> napi::Error<ErrorCode> {
 // `resolve` runs there.
 fn as_js_error(env: Env, error: napi::Error<ErrorCode>) -> napi::Error {
     napi::Error::from(JsError::from(error).into_unknown(env))
+}
+
+// napi's `serde_json` conversion builds an object by assigning each key, so a
+// `__proto__` key runs its setter, a key holding NUL is refused, and an integer
+// of 2^53 or more in size, up to 64 bits, comes back as a BigInt. A stored JSON
+// value goes to JavaScript through the runtime's own `JSON.parse` instead, once
+// serde_json has read the bytes as one JSON value, so bytes it refuses throw
+// Deserialization as before.
+fn json_value(env: Env, bytes: &[u8]) -> napi::Result<JsUnknown> {
+    let text = serde_json::from_slice::<serde_json::Value>(bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|_| std::str::from_utf8(bytes).map_err(|e| e.to_string()))
+        .map_err(|reason| as_js_error(env, coded(ErrorCode::Deserialization, reason)))?;
+    let json: JsObject = env.get_global()?.get_named_property("JSON")?;
+    let parse: JsFunction = json.get_named_property("parse")?;
+    parse.call(Some(&json), &[env.create_string(text)?])
 }
 
 /// JavaScript-friendly Store wrapper.
@@ -1346,19 +1362,17 @@ impl JsStore {
         Ok(state.map(Buffer::from))
     }
 
-    /// Get state as JSON.
-    #[napi]
-    pub fn get_state_json(&self, state_id: String) -> Result<Option<serde_json::Value>> {
-        let (store, branch) = self.target()?;
-        let state = store.get_state_on(branch, &state_id).map_err(to_napi_error)?;
-        match state {
-            Some(bytes) => {
-                let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }
+    /// Get state as JSON: its stored bytes as `JSON.parse` reads them.
+    /// Throws the deserialization error if serde_json doesn't read them as
+    /// one JSON value, as for `1e400` or a lone surrogate escape, which
+    /// `JSON.parse` would read.
+    #[napi(ts_return_type = "any | null")]
+    pub fn get_state_json(&self, env: Env, state_id: String) -> napi::Result<Option<JsUnknown>> {
+        let state = self
+            .target()
+            .and_then(|(store, branch)| store.get_state_on(branch, &state_id).map_err(to_napi_error))
+            .map_err(|error| as_js_error(env, error))?;
+        state.map(|bytes| json_value(env, &bytes)).transpose()
     }
 
     /// Set state value (for Snapshot strategy).
@@ -1640,7 +1654,8 @@ impl JsStore {
         Ok(slice.map(Buffer::from))
     }
 
-    /// Get a single item of an AppendLog state by index, as JSON.
+    /// Get a single item of an AppendLog state by index, as JSON, as
+    /// `JSON.parse` reads its bytes.
     ///
     /// O(item size) once the per-item cache is warm — unlike `getStateJson`,
     /// which materializes and converts the entire state on every call. Use
@@ -1651,27 +1666,25 @@ impl JsStore {
     /// except the last item served from the head record alone, which reads
     /// no earlier item: an `appendToState`'s, or a batch's last item where
     /// this session found the head's count exact.
-    #[napi]
+    #[napi(ts_return_type = "any | null")]
     pub fn get_state_item_json(
         &self,
+        env: Env,
         state_id: String,
         index: i64,
-    ) -> Result<Option<serde_json::Value>> {
+    ) -> napi::Result<Option<JsUnknown>> {
         if index < 0 {
             return Ok(None);
         }
-        let (store, branch) = self.target()?;
-        let item = store
-            .get_state_item_on(branch, &state_id, index as usize)
-            .map_err(to_napi_error)?;
-        match item {
-            Some(bytes) => {
-                let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }
+        let item = self
+            .target()
+            .and_then(|(store, branch)| {
+                store
+                    .get_state_item_on(branch, &state_id, index as usize)
+                    .map_err(to_napi_error)
+            })
+            .map_err(|error| as_js_error(env, error))?;
+        item.map(|bytes| json_value(env, &bytes)).transpose()
     }
 
     /// Get several items of an AppendLog state by index, as JSON, in one
@@ -1690,23 +1703,28 @@ impl JsStore {
     /// state is materialized at most once for the whole call, not once per
     /// index. A request with no index that is zero or more (an empty one,
     /// or one of negative indices only) reads nothing.
-    #[napi]
+    #[napi(ts_return_type = "Array<any | undefined | null>")]
     pub fn get_state_items_json(
         &self,
+        env: Env,
         state_id: String,
         ordinals: Vec<i64>,
-    ) -> Result<Vec<Option<serde_json::Value>>> {
+    ) -> napi::Result<Vec<Option<JsUnknown>>> {
         // A negative index answers null without a read, as getStateItemJson's
         // does; only the others go to the store.
         let asked: Vec<Option<usize>> = ordinals.iter().map(|&i| usize::try_from(i).ok()).collect();
         let wanted: Vec<usize> = asked.iter().flatten().copied().collect();
         if wanted.is_empty() {
-            return Ok(vec![None; ordinals.len()]);
+            return Ok(ordinals.iter().map(|_| None).collect());
         }
-        let (store, branch) = self.target()?;
-        let mut items = store
-            .get_state_items_by_ordinal_on(branch, &state_id, &wanted)
-            .map_err(to_napi_error)?
+        let mut items = self
+            .target()
+            .and_then(|(store, branch)| {
+                store
+                    .get_state_items_by_ordinal_on(branch, &state_id, &wanted)
+                    .map_err(to_napi_error)
+            })
+            .map_err(|error| as_js_error(env, error))?
             .into_iter();
         asked
             .into_iter()
@@ -1716,11 +1734,7 @@ impl JsStore {
                     Some(_) => items.next().flatten(),
                     None => None,
                 };
-                item.map(|bytes| {
-                    serde_json::from_slice(&bytes)
-                        .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))
-                })
-                .transpose()
+                item.map(|bytes| json_value(env, &bytes)).transpose()
             })
             .collect()
     }
@@ -1972,25 +1986,24 @@ impl JsStore {
         Ok(state.map(Buffer::from))
     }
 
-    /// Get state as JSON at a specific sequence (historical access).
-    #[napi]
+    /// Get state as JSON at a specific sequence (historical access), as
+    /// `getStateJson` reads it.
+    #[napi(ts_return_type = "any | null")]
     pub fn get_state_json_at(
         &self,
+        env: Env,
         state_id: String,
         at_sequence: i64,
-    ) -> Result<Option<serde_json::Value>> {
-        let (store, branch) = self.target()?;
-        let state = store
-            .get_state_at_on(branch, &state_id, Sequence(at_sequence as u64))
-            .map_err(to_napi_error)?;
-        match state {
-            Some(bytes) => {
-                let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }
+    ) -> napi::Result<Option<JsUnknown>> {
+        let state = self
+            .target()
+            .and_then(|(store, branch)| {
+                store
+                    .get_state_at_on(branch, &state_id, Sequence(at_sequence as u64))
+                    .map_err(to_napi_error)
+            })
+            .map_err(|error| as_js_error(env, error))?;
+        state.map(|bytes| json_value(env, &bytes)).transpose()
     }
 
     /// Get records that were caused by a given record.
